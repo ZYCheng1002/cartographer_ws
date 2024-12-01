@@ -44,14 +44,7 @@ LocalTrajectoryBuilder2D::LocalTrajectoryBuilder2D(
       real_time_correlative_scan_matcher_(
           options_.real_time_correlative_scan_matcher_options()),
       ceres_scan_matcher_(options_.ceres_scan_matcher_options()),
-      range_data_collator_(expected_range_sensor_ids) {
-    double acc_noise = 1e-2, gyro_noise = 1e-4, acc_bias_noise = 1e-6, gyro_bias_noise = 1e-8;
-    double x = 0, y = 0, z = 0;
-    const Eigen::Vector3d I_p_Gps(x, y, z);
-    eskf_ = std::make_shared<error_state_kalman::ErrorStateKalman>(acc_noise, gyro_noise,
-                                                                  acc_bias_noise, gyro_bias_noise,
-                                                                  I_p_Gps);
-}
+      range_data_collator_(expected_range_sensor_ids) {}
 
 LocalTrajectoryBuilder2D::~LocalTrajectoryBuilder2D() {}
 
@@ -81,12 +74,12 @@ std::unique_ptr<transform::Rigid2d> LocalTrajectoryBuilder2D::ScanMatch(
   // the Ceres scan matcher.
   transform::Rigid2d initial_ceres_pose = pose_prediction;
 
-  if (options_.use_online_correlative_scan_matching()) {
-    const double score = real_time_correlative_scan_matcher_.Match(
-        pose_prediction, filtered_gravity_aligned_point_cloud,
-        *matching_submap->grid(), &initial_ceres_pose);
-    kRealTimeCorrelativeScanMatcherScoreMetric->Observe(score);
-  }
+  // if (options_.use_online_correlative_scan_matching()) {
+  //   const double score = real_time_correlative_scan_matcher_.Match(
+  //       pose_prediction, filtered_gravity_aligned_point_cloud,
+  //       *matching_submap->grid(), &initial_ceres_pose);
+  //   kRealTimeCorrelativeScanMatcherScoreMetric->Observe(score);
+  // }
 
   auto pose_observation = absl::make_unique<transform::Rigid2d>();
   ceres::Solver::Summary summary;
@@ -238,11 +231,12 @@ LocalTrajectoryBuilder2D::AddAccumulatedRangeData(
   if (filtered_gravity_aligned_point_cloud.empty()) {
     return nullptr;
   }
-
-  // local map frame <- gravity-aligned frame
-    LOG(INFO) << "Before scan: "<< (pose_prediction).normalized_angle();
-    if (!state_deque_.empty()) {
-        LOG(INFO) << "ESKF: " << Eigen::Quaterniond(state_deque_.back().G_R_I).toRotationMatrix().eulerAngles(2,1,0)[0];
+  if (!active_submaps_.submaps().empty()) {
+      auto local_pose = active_submaps_.submaps().front()->local_pose();
+  }
+    if (!odom_deque_.empty()) {
+        auto pose_2d = transform::Project2D(odom_deque_.back().pose);
+        pose_prediction = pose_2d;
     }
   std::unique_ptr<transform::Rigid2d> pose_estimate_2d =
       ScanMatch(time, pose_prediction, filtered_gravity_aligned_point_cloud);
@@ -250,16 +244,10 @@ LocalTrajectoryBuilder2D::AddAccumulatedRangeData(
     LOG(WARNING) << "Scan matching failed.";
     return nullptr;
   }
-    LOG(INFO) << "After scan: "<< (*pose_estimate_2d).normalized_angle();
+    // LOG(ERROR) << "scan pose: " << (*pose_estimate_2d).translation().transpose();
   const transform::Rigid3d pose_estimate =
       transform::Embed3D(*pose_estimate_2d) * gravity_alignment;
   extrapolator_->AddPose(time, pose_estimate);
-  /// 添加到eskf
-  error_state_kalman::LaserPoseDataPtr laser_data_ptr = std::make_shared<error_state_kalman::LaserPoseData>();
-  laser_data_ptr->timestamp = common::CommonTimeToRosTime(time);
-  laser_data_ptr->position = pose_estimate.translation();
-  laser_data_ptr->orientation = pose_estimate.rotation();
-  eskf_->ProcessLaserPositionData(laser_data_ptr);
   sensor::RangeData range_data_in_local =
       TransformRangeData(gravity_aligned_range_data,
                          transform::Embed3D(pose_estimate_2d->cast<float>()));
@@ -320,30 +308,14 @@ void LocalTrajectoryBuilder2D::AddImuData(const sensor::ImuData& imu_data) {
   CHECK(options_.use_imu_data()) << "An unexpected IMU packet was added.";
   InitializeExtrapolator(imu_data.time);
   extrapolator_->AddImuData(imu_data);
-  error_state_kalman::ImuDataPtr imu_data_ptr(new error_state_kalman::ImuData);
-  imu_data_ptr->acc = imu_data.linear_acceleration;
-  imu_data_ptr->gyro = imu_data.angular_velocity;
-  imu_data_ptr->timestamp = CommonTimeToRosTime(imu_data.time);
-  error_state_kalman::State fused_state;
-  const bool ok = eskf_->ProcessImuData(imu_data_ptr, &fused_state);
-  if (!ok) {
-      LOG(WARNING) << "predict error";
-  } else {
-      state_deque_.push_back(fused_state);
-      if (state_deque_.size() > 512) {
-          state_deque_.pop_front();
-      }
-  }
 }
 
 void LocalTrajectoryBuilder2D::AddOdometryData(
     const sensor::OdometryData& odometry_data) {
-  if (extrapolator_ == nullptr) {
-    // Until we've initialized the extrapolator we cannot add odometry data.
-    LOG(INFO) << "Extrapolator not yet initialized.";
-    return;
-  }
-  extrapolator_->AddOdometryData(odometry_data);
+    odom_deque_.push_back(odometry_data);
+    while (odom_deque_.size() > 512) {
+        odom_deque_.pop_front();
+    }
 }
 
 void LocalTrajectoryBuilder2D::InitializeExtrapolator(const common::Time time) {

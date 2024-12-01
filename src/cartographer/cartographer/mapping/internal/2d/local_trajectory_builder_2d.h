@@ -119,8 +119,7 @@ class LocalTrajectoryBuilder2D {
 
   RangeDataCollator range_data_collator_;
 
-  std::shared_ptr<error_state_kalman::ErrorStateKalman> eskf_;
-  std::deque<error_state_kalman::State> state_deque_;
+  std::deque<sensor::OdometryData> odom_deque_;
 };
 
 }  // namespace mapping

@@ -121,6 +121,8 @@ Node::Node(
     tracked_pose_publisher_ =
         node_->create_publisher<::geometry_msgs::msg::PoseStamped>(
             kTrackedPoseTopic, 10);
+      tracked_eskf_ = node->create_publisher<::geometry_msgs::msg::PoseStamped>(
+         kEskfPoseTopic, 10 );
   }
 
   scan_matched_point_cloud_publisher_ =
@@ -184,6 +186,12 @@ Node::Node(
     [this]() {
       PublishConstraintList();
     });
+    double acc_noise = 1e-2, gyro_noise = 1e-4, acc_bias_noise = 1e-6, gyro_bias_noise = 1e-8;
+    double x = 0, y = 0, z = 0;
+    const Eigen::Vector3d I_p_Gps(x, y, z);
+    eskf_ = std::make_shared<error_state_kalman::ErrorStateKalman>(acc_noise, gyro_noise,
+                                                                  acc_bias_noise, gyro_bias_noise,
+                                                                  I_p_Gps);
 }
 
 Node::~Node() { FinishAllTrajectories(); }
@@ -252,8 +260,7 @@ void Node::PublishLocalTrajectoryData() {
     const auto& trajectory_data = entry.second;
 
     auto& extrapolator = extrapolators_.at(entry.first);
-    // We only publish a point cloud if it has changed. It is not needed at high
-    // frequency, and republishing it would be computationally wasteful.
+    // 时间不同, 说明前端发生了更新
     if (trajectory_data.local_slam_data->time !=
         extrapolator.GetLastPoseTime()) {
       if (scan_matched_point_cloud_publisher_->get_subscription_count() > 0) {
@@ -267,6 +274,7 @@ void Node::PublishLocalTrajectoryData() {
           point_cloud.push_back(cartographer::sensor::ToTimedRangefinderPoint(
               point, 0.f /* time */));
         }
+        // 发布点云信息
         scan_matched_point_cloud_publisher_->publish(ToPointCloud2Message(
             carto::common::ToUniversal(trajectory_data.local_slam_data->time),
             node_options_.map_frame,
@@ -308,10 +316,14 @@ void Node::PublishLocalTrajectoryData() {
       }
       return tracking_to_local_3d;
     }();
-
+    // T_m = T_ml * T_li 局部坐标系转到世界坐标系
     const Rigid3d tracking_to_map =
         trajectory_data.local_to_map * tracking_to_local;
-
+      error_state_kalman::LaserPoseDataPtr laser_data_ptr = std::make_shared<error_state_kalman::LaserPoseData>();
+      laser_data_ptr->timestamp = cartographer::common::CommonTimeToRosTime(trajectory_data.local_slam_data->time);
+      laser_data_ptr->position = tracking_to_map.translation();
+      laser_data_ptr->orientation = tracking_to_map.rotation();
+      eskf_->ProcessLaserPositionData(laser_data_ptr);
     if (trajectory_data.published_to_tracking != nullptr) {
       if (node_options_.publish_to_tf) {
         if (trajectory_data.trajectory_options.provide_odom_frame) {
@@ -832,7 +844,34 @@ void Node::HandleImuMessage(const int trajectory_id,
   auto sensor_bridge_ptr = map_builder_bridge_->sensor_bridge(trajectory_id);
   auto imu_data_ptr = sensor_bridge_ptr->ToImuData(msg);
   if (imu_data_ptr != nullptr) {
-    extrapolators_.at(trajectory_id).AddImuData(*imu_data_ptr);
+      extrapolators_.at(trajectory_id).AddImuData(*imu_data_ptr);
+      /// 添加数据到eskf
+      error_state_kalman::ImuDataPtr imu_data(new error_state_kalman::ImuData);
+      imu_data->acc = imu_data_ptr->linear_acceleration;
+      imu_data->gyro = imu_data_ptr->angular_velocity;
+      imu_data->timestamp = cartographer::common::CommonTimeToRosTime(imu_data_ptr->time);
+      error_state_kalman::State fused_state;
+      const bool ok = eskf_->ProcessImuData(imu_data, &fused_state);
+      if (!ok) {
+          LOG(WARNING) << "predict error";
+      } else {
+          state_deque_.push_back(fused_state);
+          if (state_deque_.size() > 512) {
+              state_deque_.pop_front();
+          }
+          ::geometry_msgs::msg::PoseStamped pose_msg;
+          pose_msg.header.frame_id = node_options_.map_frame;
+          pose_msg.header.stamp = msg->header.stamp;
+          Eigen::Quaterniond q = Eigen::Quaterniond(fused_state.G_R_I);
+          pose_msg.pose.position.x = fused_state.G_p_I.x();
+          pose_msg.pose.position.y = fused_state.G_p_I.y();
+          pose_msg.pose.position.z = fused_state.G_p_I.z();
+          pose_msg.pose.orientation.w = q.w();
+          pose_msg.pose.orientation.x = q.x();
+          pose_msg.pose.orientation.y = q.y();
+          pose_msg.pose.orientation.z = q.z();
+          tracked_eskf_->publish(pose_msg);
+      }
   }
   sensor_bridge_ptr->HandleImuMessage(sensor_id, msg);
 }
